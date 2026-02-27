@@ -89,21 +89,20 @@ TEST(BmsCommunication, checkFirstRequestFrame)
 TEST(BmsCommunication, statemachineRunsCompleteCycle)
 {
     can_t* mockData = (can_t*)_bmsInit1.halHandle; 
+    bms_status_t status = E_BMS_STATUS_IDLE;
 
-    // 1. Request senden
+    //start state machine
     bms_communication_cyclic(_bms1);
 
-    // 2. Response mit NEUEM Wert simulieren (z.B. 4000mV -> 0x0FA0)
+    // simulate bus response
     can_frame_t response = { .id = 0x7FFF0100, .length = 8, .data = {0xA0, 0x0F} }; 
     canMockPushResponse(mockData, &response); 
-    
-    // 3. Cyclic aufrufen. State-Machine verarbeitet 0x0FA0 
-    // und springt sofort zum nächsten Request (BUSY)
-    bms_status_t status = bms_communication_cyclic(_bms1);
-    
+
+    // continue state machine
+    status = bms_communication_cyclic(_bms1);
     TEST_ASSERT_EQUAL(E_BMS_STATUS_BUSY, status); 
-    
-    // 4. Prüfen, ob die 4000mV im "Lager" angekommen sind
+
+    // statemachine runs complete cycle
     TEST_ASSERT_EQUAL_UINT32(4000, bms_communication_getTotalVoltage(_bms1));
 }
 /*****************************************************************************************************************
@@ -120,41 +119,44 @@ TEST(BmsCommunication, readingTotalVoltage)
 TEST(BmsCommunication, cellVoltagesAreSavedIntoCorrectArraySlots)
 {
     can_t* mockData = (can_t*)_bmsInit1.halHandle; 
-    uint32_t expectedIdCells5to8 = 0x7FFF010A; // Die ID laut Protokoll
+    uint32_t expectedIdCells5to8 = 0x1FFFC10A; 
 
-    // Wir lassen die Statemachine laufen, bis sie die ID für Zellen 5-8 sendet
-    // Wir begrenzen die Versuche auf 20, damit der Test bei Fehlern nicht endlos läuft
     bool found = false;
-    for(int i = 0; i < 20; i++) 
+    
+    // iterates all commands
+    for(uint8_t i = 0; i < 20; i++) 
     {
-        bms_communication_cyclic(_bms1); // Führt Request aus
+        bms_communication_cyclic(_bms1);    
         
         if(mockData->id == expectedIdCells5to8) 
         {
-            // Gefunden! Jetzt Antwort füttern
             can_frame_t resp = 
             {
                 .id = expectedIdCells5to8,
                 .length = 8,
+                // 0x0F11 = 3857, 0x0F22 = 3874
                 .data = {0x11, 0x0F, 0x22, 0x0F, 0x33, 0x0F, 0x44, 0x0F} 
             };
+            
+   
             canMockPushResponse(mockData, &resp);
-            bms_communication_cyclic(_bms1); // Antwort verarbeiten
+
+            // statemachines has response -> go on
+            bms_communication_cyclic(_bms1); 
             found = true;
             break;
         }
-        
-        // Wenn es nicht die richtige ID war, schieben wir eine Dummy-Antwort rein,
-        // damit die Statemachine zum nächsten Befehl weitergeht
+        // dummy response for non blocking statemachine
         can_frame_t dummy = {0};
         canMockPushResponse(mockData, &dummy);
         bms_communication_cyclic(_bms1); 
     }
 
     TEST_ASSERT_TRUE_MESSAGE(found, "ID für Zellen 5-8 wurde nie gesendet!");
-    
-    // Check: Zelle 6 (Array Index 5) -> 0x0F22 = 3874
-    TEST_ASSERT_EQUAL_UINT16(3874, bms_communication_getCellVoltage(_bms1, 5));
+    TEST_ASSERT_EQUAL_UINT16(3857, bms_communication_getCellVoltage(_bms1, 4)); // query cell 5
+    TEST_ASSERT_EQUAL_UINT16(3874, bms_communication_getCellVoltage(_bms1, 5)); // query cell 6
+    TEST_ASSERT_EQUAL_UINT16(3891, bms_communication_getCellVoltage(_bms1, 6)); // query cell 7
+    TEST_ASSERT_EQUAL_UINT16(3908, bms_communication_getCellVoltage(_bms1, 7)); // query cell 8
 }
 /*****************************************************************************************************************
 * This test
@@ -175,11 +177,11 @@ TEST(BmsCommunication, getCellVoltageBoundaryCheck)
 /*****************************************************************************************************************
 * This test
 ******************************************************************************************************************/
-/*TEST(BmsCommunication, canCommunicationClosesSuccessfully)
-{
-    can_t* mockData = (can_t*)_bmsInit1.halHandle;
-    TEST_ASSERT_FALSE(mockData->comPortOpen);
-}*/
+
+
+
+
+
 //ifdef test
 //#define STATIC
 //#else

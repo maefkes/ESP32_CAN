@@ -152,12 +152,12 @@ static void _decodeFrame(bms_com_t* bms)
  **************************************************************************/
 static bms_state_t _canStatemachine(bms_com_t* bms)
 {
-    //bool stateChanged = true;
+    bool stateChanged = true;
 
     // while loop makes statemachine faster
-    //while(stateChanged)
+    while(stateChanged)
     {
-        //stateChanged = false; 
+        stateChanged = false; 
 
         switch(bms->state)
         {
@@ -180,7 +180,7 @@ static bms_state_t _canStatemachine(bms_com_t* bms)
                 	
                     bms->rxFrame = frameBuffer;
                     bms->state = E_BMS_STATE_EXTRACT_DATA;
-                    //stateChanged = true; 
+                    stateChanged = true; 
                  }
             }
             break;
@@ -188,13 +188,13 @@ static bms_state_t _canStatemachine(bms_com_t* bms)
             case E_BMS_STATE_EXTRACT_DATA:
                 _decodeFrame(bms); 
                 bms->state = E_BMS_STATE_NEW_DATA_AVALAIBLE;
-               // stateChanged = true; 
+                stateChanged = true; 
                 break;
 
             case E_BMS_STATE_NEW_DATA_AVALAIBLE:
                 bms->sendCount++;
                 bms->state = E_BMS_STATE_IDLE;
-                //stateChanged = true; 
+                stateChanged = true; 
                 break;
 
             case E_BMS_STATE_ERROR:
