@@ -68,7 +68,7 @@ static void _setupBmsCom(void)
 hal_status_t _can_write(void* handle, void* data, uint8_t length)
 {
     can_frame_t* frame = (can_frame_t*)data;
-    twai_message_t tx_msg = {0}; // <--- ALLES auf Null setzen (C99 Standard)
+    twai_message_t tx_msg = {0}; 
 
     tx_msg.identifier = (frame->id & 0x1FFFFFFF); 
     tx_msg.extd = 1;               
