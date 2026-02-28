@@ -9,6 +9,7 @@ bms_communication.c
 #include <string.h>
 #include "bms_communication.h"
 #include "generic_hardware_interface.h"
+#include "interrupt_handler.h"
 /*** local constants ******************************************************/
 #define C_BMS_COM_INSTANCES_MAX (2)
 static const uint8_t C_DATA_REQUEST_BITS    =   14u;
@@ -131,19 +132,64 @@ static void _buildCanFrame(bms_com_t* bms, bms_command_t cmd, can_frame_t* frame
 /*=============================== PRIVATE ==========================================*/
 static void _decodeFrame(bms_com_t* bms)
 {
-    if (bms->sendCount == E_BMS_CMD1_TOTAL_VALUES) 
-    {
-        bms->data.totalVoltage = (uint32_t)((bms->rxFrame.data[1] << 8) | bms->rxFrame.data[0]);
-    }
-    else if (bms->sendCount >= E_BMS_CMD1_CELL_VLTG_1_TO_4 && bms->sendCount <= E_BMS_CMD1_CELL_VLTG_13_TO_16)
-    {
-        uint8_t startIndex = (bms->sendCount - E_BMS_CMD1_CELL_VLTG_1_TO_4) * 4;
 
-        for (uint8_t i = 0; i < 4; i++) 
+    uint8_t fct = _command[bms->sendCount].cmdFctTable;
+    uint8_t idx = _command[bms->sendCount].cmdID;
+    const uint8_t* d = bms->rxFrame.data;
+
+    if (fct == 0x01) 
+    {
+        switch (idx)
         {
-            uint8_t lowByte = bms->rxFrame.data[i * 2];
-            uint8_t highByte = bms->rxFrame.data[(i * 2) + 1];
-            bms->data.cellVoltage[startIndex + i] = (uint16_t)((highByte << 8) | lowByte);
+            case 0x00: // Total Voltage (u32) & Current (i32)
+                bms->data.totalVoltage = (uint32_t)((d[3] << 24) | (d[2] << 16) | (d[1] << 8) | d[0]); 
+                bms->data.totalCurrent = (int32_t)((d[7] << 24) | (d[6] << 16) | (d[5] << 8) | d[4]); 
+                break;
+
+            case 0x01: // Full & Remaining Capacity (u32)
+                bms->data.fullChargeCapacity = (uint32_t)((d[3] << 24) | (d[2] << 16) | (d[1] << 8) | d[0]);
+                bms->data.remainingCapacity = (uint32_t)((d[7] << 24) | (d[6] << 16) | (d[5] << 8) | d[4]);
+                break;
+
+            case 0x03: // Cell Limits & Diff 
+                bms->data.maxCellVoltage  = (uint16_t)((d[1] << 8) | d[0]);
+                bms->data.minCellVoltage  = (uint16_t)((d[3] << 8) | d[2]);
+                bms->data.cellDiffVoltage = (uint16_t)((d[5] << 8) | d[4]);
+                break;
+
+            case 0x05: // Alarm Status A & B 
+                bms->data.alarmStatusA = (uint16_t)((d[1] << 8) | d[0]);
+                bms->data.alarmStatusB = (uint16_t)((d[3] << 8) | d[2]);
+                break;
+
+            case 0x06: // Protect A & B 
+                bms->data.protectA = (uint16_t)((d[1] << 8) | d[0]);
+                bms->data.protectB = (uint16_t)((d[3] << 8) | d[2]);
+                break;
+
+            case 0x09: case 0x0A: case 0x0B: case 0x0C: 
+            {
+                uint8_t startCell = (idx - 0x09) * 4;
+                for (int i = 0; i < 4; i++) {
+                    bms->data.cellVoltage[startCell + i] = (uint16_t)((d[i*2+1] << 8) | d[i*2]);
+                }
+                break;
+            }
+        }
+    }
+    else if (fct == 0x02) 
+    {
+        #define K_TO_C(val) ((val - 2731) / 10)
+
+        if (idx == 0x00) 
+        { 
+            uint16_t rawMax = (uint16_t)((d[1] << 8) | d[0]);
+            bms->data.maxTemperature = K_TO_C(rawMax); 
+        }
+        else if (idx == 0x01) 
+        { 
+            uint16_t rawMin = (uint16_t)((d[1] << 8) | d[0]); 
+            bms->data.lowestTempertaure = K_TO_C(rawMin);
         }
     }
 }
@@ -153,8 +199,8 @@ static void _decodeFrame(bms_com_t* bms)
 static bms_state_t _canStatemachine(bms_com_t* bms)
 {
     bool stateChanged = true;
+    static uint32_t timeoutRetry = 0; 
 
-    // while loop makes statemachine faster
     while(stateChanged)
     {
         stateChanged = false; 
@@ -167,21 +213,40 @@ static bms_state_t _canStatemachine(bms_com_t* bms)
                     if(_sendCanFrame(bms, _command[bms->sendCount]) == E_HAL_STATUS_OK) 
                     {
                         bms->state = E_BMS_STATE_WAIT_FOR_RESPONSE;
+                        timeoutRetry = 0; 
                     }
+                }
+                else 
+                {
+                    bms->sendCount = 0; 
                 }
                 break;
 
             case E_BMS_STATE_WAIT_FOR_RESPONSE:
             {
-            	can_frame_t frameBuffer; 
-
+                can_frame_t frameBuffer; 
                 if(bms->read(bms->handle, &frameBuffer) == E_HAL_STATUS_OK)
                 {
-                	
-                    bms->rxFrame = frameBuffer;
-                    bms->state = E_BMS_STATE_EXTRACT_DATA;
-                    stateChanged = true; 
-                 }
+                    uint32_t expectedId = ((uint32_t)bms->slaveID << 12) | 
+                                          ((uint32_t)_command[bms->sendCount].cmdFctTable << 8) | 
+                                           (uint32_t)_command[bms->sendCount].cmdID;
+
+                    if (frameBuffer.id == expectedId) 
+                    {
+                        bms->rxFrame = frameBuffer;
+                        bms->state = E_BMS_STATE_EXTRACT_DATA;
+                        stateChanged = true; 
+                    }
+                }
+                else 
+                {
+                    timeoutRetry++;
+                    if(timeoutRetry > 100) {
+                        bms->sendCount++; 
+                        bms->state = E_BMS_STATE_IDLE;
+                        stateChanged = true;
+                    }
+                }
             }
             break;
 
@@ -194,14 +259,10 @@ static bms_state_t _canStatemachine(bms_com_t* bms)
             case E_BMS_STATE_NEW_DATA_AVALAIBLE:
                 bms->sendCount++;
                 bms->state = E_BMS_STATE_IDLE;
-                stateChanged = true; 
+                //stateChanged = true; 
                 break;
 
-            case E_BMS_STATE_ERROR:
-            	break;
-
-            default:
-            	break;
+            default: break;
         }
     }
     return bms->state;
@@ -237,24 +298,182 @@ static hal_status_t _sendCanFrame(bms_com_t* bms, bms_command_t cmd)
 /***************************************************************************
  * This function
  **************************************************************************/
-uint16_t bms_communication_getCellVoltage(bms_com_t* bms, uint8_t cellIndex)
+uint32_t bms_communication_getTotalVoltage(bms_com_t* bms) 
 {
     assert(bms);
-    
-    if (cellIndex >= 16)
-    {
-        return 0xFFFF; 
-    }
 
-    return bms->data.cellVoltage[cellIndex];
+    interrupt_handler_enterCritical();
+    uint32_t retval = bms->data.totalVoltage; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
 }
 /***************************************************************************
  * This function
  **************************************************************************/
-uint32_t bms_communication_getTotalVoltage(bms_com_t* bms) 
+int32_t bms_communication_getTotalCurrent(bms_com_t* bms) 
 {
     assert(bms);
-    return bms->data.totalVoltage;
+    interrupt_handler_enterCritical();
+    int32_t retval = bms->data.totalCurrent; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+uint32_t bms_communication_getFullCapacity(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    uint32_t retval = bms->data.fullChargeCapacity; 
+    interrupt_handler_leaveCritical();
+    
+    return retval;
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+uint32_t bms_communication_getRemainingCapacity(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    uint32_t retval = bms->data.remainingCapacity; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+uint16_t bms_communication_getCellVoltage(bms_com_t* bms, uint8_t cellIndex) 
+{
+    assert(bms);
+
+    if (cellIndex >= 16) return 0xFFFF; 
+
+    interrupt_handler_enterCritical();
+    uint16_t retval = bms->data.cellVoltage[cellIndex]; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+uint16_t bms_communication_getMaxCellVoltage(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    uint16_t retval = bms->data.maxCellVoltage; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+uint16_t bms_communication_getMinCellVoltage(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    uint16_t retval = bms->data.minCellVoltage; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+int16_t bms_communication_getMaxTemperature(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    int16_t retval =  (int16_t)bms->data.maxTemperature; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+int16_t bms_communication_getMinTemperature(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    int16_t retval = (int16_t)bms->data.lowestTempertaure; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+uint16_t bms_communication_getAlarmStatusA(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    uint16_t retval = bms->data.alarmStatusA; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+uint16_t bms_communication_getAlarmStatusB(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    uint16_t retval = bms->data.alarmStatusB; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+uint16_t bms_communication_getProtectA(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    uint16_t retval = bms->data.protectA; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
+
+}
+/***************************************************************************
+ * This function
+ **************************************************************************/
+uint16_t bms_communication_getProtectB(bms_com_t* bms) 
+{
+    assert(bms);
+
+    interrupt_handler_enterCritical();
+    uint16_t retval = bms->data.protectB; 
+    interrupt_handler_leaveCritical();
+
+    return retval;
 }
 /***************************************************************************
  * This function
@@ -333,6 +552,7 @@ void bms_communication_init(void)
 {
     if(!_initialized)
     {
+        interrupt_handler_init();
 
         for (uint8_t i = 0; i < C_BMS_COM_INSTANCES_MAX; i++)
         {
